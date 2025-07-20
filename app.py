@@ -1,164 +1,101 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import uvicorn
-import os
-import chromadb
-from chromadb.config import Settings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-import uuid
 from typing import List, Optional
+import os, uuid
 
-app = FastAPI(title="RAG Application", description="A RAG application with ChromaDB integration")
+import chromadb
+from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
+from fastembed import TextEmbedding
 
-# Initialize ChromaDB client
-chroma_client = chromadb.Client(Settings(
-    chroma_db_impl="duckdb+parquet",
-    persist_directory="./chroma_db"
-))
+###############################################################################
+# 1.  FastEmbed wrapper – makes FastEmbed look like a Chroma EmbeddingFunction
+###############################################################################
+class FastEmbedEmbeddingFunction(EmbeddingFunction[Documents]):
+    def __init__(self,
+                 model_name: str = "BAAI/bge-small-en-v1.5",
+                 batch_size: int = 64):
+        self._model = TextEmbedding(model_name=model_name, batch_size=batch_size)
 
-# Create or get collection
-collection_name = "documents"
-try:
-    collection = chroma_client.get_collection(name=collection_name)
-except:
-    collection = chroma_client.create_collection(name=collection_name)
+    def __call__(self, docs: Documents) -> Embeddings:       # type: ignore[override]
+        # FastEmbed returns a generator; wrap it in a list so Chroma can use it
+        return list(self._model.embed(list(docs)))
 
-# Initialize text splitter with recursive chunking
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=750,
-    chunk_overlap=100,
-    length_function=len,
-    separators=["\n\n", "\n", " ", ""]
+    # Optional helpers --------------------------------------------------------
+    def max_tokens(self) -> int:
+        # FastEmbed’s small-bge models cap at 512 tokens, keep chunks < 512 chars
+        return 512
+
+
+###############################################################################
+# 2.  FastAPI app + Chroma persistent client
+###############################################################################
+DB_PATH = "./db"                 # creates ./db on first run
+os.makedirs(DB_PATH, exist_ok=True)
+
+chroma_client = chromadb.PersistentClient(path=DB_PATH)
+collection = chroma_client.get_or_create_collection(
+    name="rag_docs",
+    embedding_function=FastEmbedEmbeddingFunction()
 )
 
-class DocumentInput(BaseModel):
-    text: str
-    metadata: Optional[dict] = None
-    document_id: Optional[str] = None
+app = FastAPI(title="RAG Ingestion Service")
 
-class DocumentResponse(BaseModel):
+
+###############################################################################
+# 3.  Helper: fixed-window chunker (500 chars, 50-char overlap)
+###############################################################################
+def chunk_text(txt: str,
+               window: int = 500,
+               overlap: int = 50) -> List[str]:
+    if overlap >= window:
+        raise ValueError("overlap must be smaller than window size")
+    chunks = []
+    start = 0
+    while start < len(txt):
+        end = start + window
+        chunks.append(txt[start:end])
+        start += window - overlap
+    return chunks
+
+
+###############################################################################
+# 4.  API schema + endpoint
+###############################################################################
+class IngestRequest(BaseModel):
     document_id: str
-    chunks_created: int
-    message: str
+    text: str
+    source: Optional[str] = "manual"
+    use_content_hash_ids: bool = False   # optional: stable IDs if text changes
 
-@app.get('/')
-def hello():
-    return {"message": "RAG Application with ChromaDB", "endpoints": ["/ingest", "/search"]}
 
-@app.post('/ingest', response_model=DocumentResponse)
-async def ingest_document(document: DocumentInput):
-    """
-    Ingest text document into ChromaDB with recursive chunking.
-    
-    - chunk_size: 750 characters
-    - chunk_overlap: 100 characters
-    """
-    try:
-        # Generate document ID if not provided
-        if not document.document_id:
-            document.document_id = str(uuid.uuid4())
-        
-        # Split text into chunks
-        chunks = text_splitter.split_text(document.text)
-        
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No text chunks created")
-        
-        # Prepare metadata for each chunk
-        chunk_metadata = []
-        chunk_ids = []
-        
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{document.document_id}_chunk_{i}"
-            chunk_ids.append(chunk_id)
-            
-            # Create metadata for this chunk
-            chunk_meta = {
-                "document_id": document.document_id,
-                "chunk_index": i,
-                "total_chunks": len(chunks),
-                "chunk_size": len(chunk)
-            }
-            
-            # Add custom metadata if provided
-            if document.metadata:
-                chunk_meta.update(document.metadata)
-            
-            chunk_metadata.append(chunk_meta)
-        
-        # Add chunks to ChromaDB collection
-        collection.add(
-            documents=chunks,
-            metadatas=chunk_metadata,
-            ids=chunk_ids
+@app.post("/ingest")
+def ingest(req: IngestRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text payload is empty")
+
+    chunks = chunk_text(req.text)
+    ids, metas = [], []
+
+    for idx, chunk in enumerate(chunks):
+        chunk_id = (
+            f"{req.document_id}_{idx}"
+            if not req.use_content_hash_ids
+            else f"{req.document_id}_{uuid.uuid5(uuid.NAMESPACE_URL, chunk)}"
         )
-        
-        return DocumentResponse(
-            document_id=document.document_id,
-            chunks_created=len(chunks),
-            message=f"Successfully ingested document with {len(chunks)} chunks"
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error ingesting document: {str(e)}")
+        ids.append(chunk_id)
+        metas.append({
+            "document_id": req.document_id,
+            "chunk_index": idx,
+            "source": req.source,
+            "chars": len(chunk)
+        })
 
-@app.get('/search')
-async def search_documents(query: str, n_results: int = 5):
-    """
-    Search for documents in ChromaDB using semantic similarity.
-    """
-    try:
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results
-        )
-        
-        return {
-            "query": query,
-            "results": results
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error searching documents: {str(e)}")
-
-@app.get('/documents')
-async def list_documents():
-    """
-    List all documents in the collection.
-    """
-    try:
-        # Get all documents from collection
-        results = collection.get()
-        
-        # Group by document_id
-        documents = {}
-        for i, doc_id in enumerate(results['ids']):
-            metadata = results['metadatas'][i]
-            document_id = metadata.get('document_id', doc_id)
-            
-            if document_id not in documents:
-                documents[document_id] = {
-                    "document_id": document_id,
-                    "chunks": [],
-                    "total_chunks": metadata.get('total_chunks', 1)
-                }
-            
-            documents[document_id]["chunks"].append({
-                "chunk_id": doc_id,
-                "chunk_index": metadata.get('chunk_index', 0),
-                "text": results['documents'][i][:100] + "..." if len(results['documents'][i]) > 100 else results['documents'][i]
-            })
-        
-        return {
-            "total_documents": len(documents),
-            "documents": list(documents.values())
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing documents: {str(e)}")
-
-if __name__ == '__main__':
-    port = os.environ.get('FLASK_PORT') or 8080
-    port = int(port)
-
-    uvicorn.run(app, host='0.0.0.0', port=port)
+    collection.upsert(ids=ids, documents=chunks, metadatas=metas)
+    return {
+        "ingested": len(ids),
+        "collection": collection.name,
+        "ids": ids
+    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8080, reload=True)

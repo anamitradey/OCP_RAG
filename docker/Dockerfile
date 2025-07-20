@@ -1,22 +1,31 @@
-FROM registry.access.redhat.com/ubi9/python-39:1-117.1684741281
+FROM python:3.11-slim AS base
 
-# By default, listen on port 8081
-EXPOSE 8081/tcp
-ENV FLASK_PORT=8081
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# Set the working directory in the container
-WORKDIR /projects
+WORKDIR /app
 
-# Copy the content of the local src directory to the working directory
+# System deps (only if needed; keep minimal)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for caching
+COPY requirements.txt .
+
+# (Optional) pin pydantic v1 if using old validators
+# In requirements.txt: pydantic<2
+
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Copy app
 COPY . .
 
-# Install any dependencies
-RUN \
-  if [ -f requirements.txt ]; \
-    then pip install -r requirements.txt; \
-  elif [ `ls -1q *.txt | wc -l` == 1 ]; \
-    then pip install -r *.txt; \
-  fi
+# Ensure the Chroma persistence dir exists & is writable (OpenShift random UID)
+RUN mkdir -p /app/db && chmod -R g+rwX /app && chgrp -R 0 /app
 
-# Specify the command to run on container start
-CMD [ "python", "./app.py" ]
+EXPOSE 8080
+# Start the server
+CMD ["python", "app.py"]
+# -----------------------------------------

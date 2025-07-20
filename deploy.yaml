@@ -1,38 +1,88 @@
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: rag-chroma-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
 kind: Deployment
 apiVersion: apps/v1
 metadata:
-  name: my-python
+  name: rag-fastembed
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: python-app
+      app: rag-fastembed
   template:
     metadata:
       labels:
-        app: python-app
+        app: rag-fastembed
     spec:
       containers:
-        - name: my-python
-          image: python-image:latest
+        - name: rag-fastembed
+          image: rag-fastembed:0.1.0  # update to your registry path once pushed
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
-              containerPort: 8081
-              protocol: TCP
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
           resources:
             requests:
-              memory: "50Mi"
-              cpu: "10m"
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: chroma-data
+              mountPath: /projects/db
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        fsGroup: 0
+      volumes:
+        # Use this if you want persistence:
+        - name: chroma-data
+          persistentVolumeClaim:
+            claimName: rag-chroma-pvc
+        # Or comment the PVC above and uncomment the emptyDir below for ephemeral storage:
+        # - name: chroma-data
+        #   emptyDir: {}
 ---
 kind: Service
 apiVersion: v1
 metadata:
-  name: my-python
+  name: rag-fastembed
 spec:
-  ports:
-    - name: http-8081
-      port: 8081
-      protocol: TCP
-      targetPort: 8081
   selector:
-    app: python-app
+    app: rag-fastembed
+  ports:
+    - name: http-8080
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
