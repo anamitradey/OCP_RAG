@@ -1,11 +1,15 @@
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 import os, uuid
+import shutil
+from pathlib import Path
 
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 from fastembed import TextEmbedding
+import openai
 
 ###############################################################################
 # 1.  FastEmbed wrapper – makes FastEmbed look like a Chroma EmbeddingFunction
@@ -29,14 +33,24 @@ class FastEmbedEmbeddingFunction(EmbeddingFunction[Documents]):
 ###############################################################################
 # 2.  FastAPI app + Chroma persistent client
 ###############################################################################
-DB_PATH = "./db"                 # creates ./db on first run
-os.makedirs(DB_PATH, exist_ok=True)
+DB_PATH = Path("./db")                 # creates ./db on first run
+load_dotenv(override=False)  # respects existing env vars from Secrets
+
+DB_PATH.mkdir(parents=True, exist_ok=True)
 
 chroma_client = chromadb.PersistentClient(path=DB_PATH)
 collection = chroma_client.get_or_create_collection(
     name="rag_docs",
     embedding_function=FastEmbedEmbeddingFunction()
 )
+
+# --------------------------- OpenAI --------------------------- #
+openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    raise RuntimeError(
+        "OPENAI_API_KEY not found. Set it via env/Secret or .env file for local dev."
+    )
+
 
 app = FastAPI(title="RAG Ingestion Service")
 
@@ -67,6 +81,22 @@ class IngestRequest(BaseModel):
     source: Optional[str] = "manual"
     use_content_hash_ids: bool = False   # optional: stable IDs if text changes
 
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 4
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+
+class ChatRequest(SearchRequest):
+    model: str = DEFAULT_OPENAI_MODEL
+    temperature: float = 0.2
+
+# --------------------------- Routes --------------------------- #
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "openai_model": DEFAULT_OPENAI_MODEL,
+    }
 
 @app.post("/ingest")
 def ingest(req: IngestRequest):
@@ -95,6 +125,72 @@ def ingest(req: IngestRequest):
         "ingested": len(ids),
         "collection": collection.name,
         "ids": ids
+    }
+@app.delete("/collection/reset")
+def reset_collection():
+    if DB_PATH.exists():
+        shutil.rmtree(DB_PATH)
+
+    DB_PATH.mkdir(parents=True, exist_ok=True)
+
+    # 3. Recreate client & collection
+    chroma_client = chromadb.PersistentClient(path=str(DB_PATH))
+    collection = chroma_client.get_or_create_collection(
+        name="rag_docs",
+        embedding_function=FastEmbedEmbeddingFunction()
+    )
+    return {"status": "ok"}
+@app.delete("/docs/{document_id}")
+def delete_doc(document_id: str):
+    deleted = collection.delete(where={"document_id": document_id})
+    return {"deleted_ids": deleted}
+@app.post("/search")
+def search(req: SearchRequest):
+    res = collection.query(
+        query_texts=[req.query],
+        n_results=req.top_k,
+        include=["documents", "metadatas", "ids"],
+    )
+    results = [
+        {"id": i, "text": d, "meta": m}
+        for i, d, m in zip(res["ids"][0], res["documents"][0], res["metadatas"][0])
+    ]
+    return {"query": req.query, "top_k": req.top_k, "results": results}
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    res = collection.query(
+        query_texts=[req.query],
+        n_results=req.top_k,
+        include=["documents", "ids"],
+    )
+    context = "\n\n".join(res["documents"][0])
+    ids = res["ids"][0]
+
+    system_prompt = (
+        "You are a helpful assistant. Use the provided context to answer the user's question. "
+        "If the answer is not in the context, say you don't know." 
+    )
+    user_prompt = f"Context:\n{context}\n\nQuestion: {req.query}\nAnswer:"
+
+    try:
+        response = openai.ChatCompletion.create(
+            model=req.model,
+            temperature=req.temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
+
+    return {
+        "question": req.query,
+        "answer": answer,
+        "sources": ids,
+        "model": req.model,
     }
 if __name__ == "__main__":
     import uvicorn
