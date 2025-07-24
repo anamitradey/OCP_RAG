@@ -2,5 +2,6 @@
 .odo/env
 .odo/odo-file-index.json
 /venv
+/env
 /db
 /__pycache__
