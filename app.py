@@ -51,6 +51,9 @@ if not openai.api_key:
         "OPENAI_API_KEY not found. Set it via env/Secret or .env file for local dev."
     )
 
+client = openai.OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),  # Or leave empty if the env variable is set
+)
 
 app = FastAPI(title="RAG Ingestion Service")
 
@@ -147,9 +150,9 @@ def delete_doc(document_id: str):
 @app.post("/search")
 def search(req: SearchRequest):
     res = collection.query(
-        query_texts=[req.query],
-        n_results=req.top_k,
-        include=["documents", "metadatas", "ids"],
+    query_texts=[req.query],
+    n_results=req.top_k,
+    include=["documents", "metadatas"],   # <- drop "ids"
     )
     results = [
         {"id": i, "text": d, "meta": m}
@@ -161,8 +164,8 @@ def search(req: SearchRequest):
 def chat(req: ChatRequest):
     res = collection.query(
         query_texts=[req.query],
-        n_results=req.top_k,
-        include=["documents", "ids"],
+        n_results=1,
+        include=["documents", "metadatas"],
     )
     context = "\n\n".join(res["documents"][0])
     ids = res["ids"][0]
@@ -174,12 +177,12 @@ def chat(req: ChatRequest):
     user_prompt = f"Context:\n{context}\n\nQuestion: {req.query}\nAnswer:"
 
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model=req.model,
             temperature=req.temperature,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user",   "content": user_prompt},
             ],
         )
         answer = response.choices[0].message.content.strip()
