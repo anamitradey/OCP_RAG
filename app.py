@@ -131,18 +131,14 @@ def ingest(req: IngestRequest):
     }
 @app.delete("/collection/reset")
 def reset_collection():
-    if DB_PATH.exists():
-        shutil.rmtree(DB_PATH)
-
-    DB_PATH.mkdir(parents=True, exist_ok=True)
-
-    # 3. Recreate client & collection
-    chroma_client = chromadb.PersistentClient(path=str(DB_PATH))
-    collection = chroma_client.get_or_create_collection(
-        name="rag_docs",
-        embedding_function=FastEmbedEmbeddingFunction()
-    )
-    return {"status": "ok"}
+    while True:
+        batch = collection.peek().get("ids", [])
+        if not batch:
+            break
+        collection.delete(ids=batch)
+    return {
+        "status": "ok"
+    }
 @app.delete("/docs/{document_id}")
 def delete_doc(document_id: str):
     deleted = collection.delete(where={"document_id": document_id})
